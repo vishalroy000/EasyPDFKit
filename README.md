@@ -106,7 +106,7 @@ Open your **app-level** `build.gradle.kts` and add:
 ```kotlin
 // build.gradle.kts (App module)
 dependencies {
-    implementation("com.github.vishalroy000.EasyPDFKit:easypdfkit:v1.0.0")
+ implementation("com.github.vishalroy000:EasyPDFKit:v1.0.0")
 }
 ```
 
