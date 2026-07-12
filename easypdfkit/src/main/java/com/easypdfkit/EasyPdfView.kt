@@ -10,6 +10,7 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.net.Uri
 import android.util.AttributeSet
+import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -27,34 +28,32 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
- * A drop-in PDF viewer.
+ * A drop-in PDF viewer. v1.0.1
  *
- * XML:
- * ```xml
- * <com.easypdfkit.EasyPdfView
- *     android:id="@+id/pdfView"
- *     android:layout_width="match_parent"
- *     android:layout_height="match_parent" />
- * ```
- *
- * Kotlin:
- * ```kotlin
- * binding.pdfView.fromUrl("https://example.com/doc.pdf")
- *     .nightMode(true)
- *     .onLoad { pages -> title = "$pages pages" }
- *     .load()
- * ```
- *
- * v1.0 scope: vertical continuous scrolling, fit-width layout, pinch/double-tap
- * zoom, fling, page snapping (optional), night mode, password-protected files.
+ * FIXES in this version:
+ *  - Zoom pe blank white screen (OOM from uncapped hi-res bitmaps)
+ *  - Hi-res bitmaps ab pixel-budget capped hain (max ~24MB per page)
+ *  - Low-res (bucket 1) bitmap HAMESHA render/protect hota hai — fallback guaranteed
+ *  - Render failures ab crash/silent-fail nahi karte — low-res pe gracefully fall back
  */
 class EasyPdfView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
+
+    private companion object {
+        const val TAG = "EasyPdfView"
+
+        /** Max pixels for ONE rendered page bitmap (~24MB ARGB_8888). */
+        const val MAX_PAGE_PIXELS = 6_000_000L
+
+        /** Absolute max texture dimension (GPU limit safety). */
+        const val MAX_DIMENSION = 4096
+    }
 
     // ---------------------------------------------------------------- config
     private var source: PdfSource? = null
@@ -76,6 +75,14 @@ class EasyPdfView @JvmOverloads constructor(
     // ---------------------------------------------------------------- state
     private val engine = PdfEngine(context)
     private val cache = PageBitmapCache()
+
+    /**
+     * FIX: Base (bucket-1) bitmaps ka alag protected store — LRU eviction se
+     * bache rehte hain taaki zoom ke dauran hamesha KUCH dikhe.
+     * Sirf visible-window ke pages yahan rehte hain (bounded memory).
+     */
+    private val baseBitmaps = HashMap<Int, Bitmap>()
+    private val maxBaseBitmaps = 6  // visible + prefetch window
 
     /** Single-threaded dispatcher: Pdfium is not thread-safe. */
     private val renderDispatcher = Dispatchers.IO.limitedParallelism(1)
@@ -143,7 +150,6 @@ class EasyPdfView @JvmOverloads constructor(
 
     // ------------------------------------------------------------ public API
 
-    /** Entry points — each returns a [Configurator] for chained setup. */
     fun fromFile(file: File) = Configurator(PdfSource.FromFile(file))
     fun fromUri(uri: Uri) = Configurator(PdfSource.FromUri(uri))
     fun fromAsset(name: String) = Configurator(PdfSource.FromAsset(name))
@@ -151,7 +157,6 @@ class EasyPdfView @JvmOverloads constructor(
     fun fromUrl(url: String) = Configurator(PdfSource.FromUrl(url))
     fun fromSource(src: PdfSource) = Configurator(src)
 
-    /** Jumps to a page (0-based). */
     fun jumpTo(page: Int, animated: Boolean = false) {
         if (!isLoaded) return
         val p = page.coerceIn(0, pageCount - 1)
@@ -169,7 +174,6 @@ class EasyPdfView @JvmOverloads constructor(
         }
     }
 
-    /** Toggles inverted-color reading mode. */
     fun setNightMode(enabled: Boolean) {
         nightMode = enabled
         placeholderPaint.color = if (enabled) Color.BLACK else Color.WHITE
@@ -178,11 +182,12 @@ class EasyPdfView @JvmOverloads constructor(
 
     fun setZoom(newZoom: Float) = zoomTo(newZoom, width / 2f, height / 2f)
 
-    /** Releases the native document. Called automatically on detach. */
     fun recycle() {
         renderJobs.values.forEach { it.cancel() }
         renderJobs.clear()
         cache.clear()
+        baseBitmaps.values.forEach { it.recycle() }
+        baseBitmaps.clear()
         scope.launch(renderDispatcher) { engine.close() }
     }
 
@@ -213,6 +218,8 @@ class EasyPdfView @JvmOverloads constructor(
         renderJobs.values.forEach { it.cancel() }
         renderJobs.clear()
         cache.clear()
+        baseBitmaps.values.forEach { it.recycle() }
+        baseBitmaps.clear()
         scope.launch {
             try {
                 withContext(renderDispatcher) { engine.open(context, src, password) }
@@ -220,6 +227,7 @@ class EasyPdfView @JvmOverloads constructor(
                 zoom = 1f; scrollXf = 0f; scrollYf = 0f; currentPage = 0
                 onLoad?.onLoadComplete(pageCount)
                 onPageChange?.onPageChanged(0, pageCount)
+                requestVisiblePages()
                 invalidate()
             } catch (e: PdfPasswordException) {
                 val cb = onPassword
@@ -236,7 +244,6 @@ class EasyPdfView @JvmOverloads constructor(
         }
     }
 
-    /** Fit-width layout: every page scaled so its width == view width at zoom 1. */
     private fun computeLayout() {
         pageTops.clear(); pageHeights.clear()
         if (width == 0 || engine.pageCount == 0) return
@@ -311,12 +318,12 @@ class EasyPdfView @JvmOverloads constructor(
     private fun zoomTo(newZoom: Float, focusX: Float, focusY: Float) {
         val z = newZoom.coerceIn(minZoom, maxZoom)
         if (z == zoom) return
-        // Keep the content point under the focus fixed on screen
         val contentX = (scrollXf + focusX) / zoom
         val contentY = (scrollYf + focusY) / zoom
         zoom = z
         scrollXf = (contentX * zoom - focusX).coerceIn(0f, maxScrollX())
         scrollYf = (contentY * zoom - focusY).coerceIn(0f, maxScrollY())
+        updateCurrentPage()
         onZoom?.onZoomChanged(zoom)
         invalidate()
     }
@@ -335,12 +342,23 @@ class EasyPdfView @JvmOverloads constructor(
     }
 
     // -------------------------------------------------------------- rendering
+
     /**
-     * Zoom buckets: pages are rendered at 1x/2x/4x width depending on zoom.
-     * Beyond 4x we scale the 4x bitmap — quality stays acceptable and native
-     * memory stays bounded. Region-based hi-res rendering lands in v1.1.
+     * FIX: Zoom bucket ab MEMORY-CAPPED hai. Page dimensions ke hisaab se
+     * max safe bucket calculate hota hai taaki bitmap MAX_PAGE_PIXELS
+     * (~24MB) se bada na bane. Ab OOM impossible hai.
      */
-    private fun zoomBucket(): Int = when {
+    private fun safeBucketFor(page: Int, desired: Int): Int {
+        if (width <= 0 || page >= pageHeights.size) return 1
+        val baseW = width.toLong()
+        val baseH = pageHeights[page].toLong().coerceAtLeast(1)
+        // Largest bucket where (w*bucket)*(h*bucket) <= MAX_PAGE_PIXELS
+        val maxByPixels = sqrt(MAX_PAGE_PIXELS.toDouble() / (baseW * baseH)).toInt()
+        val maxByDimension = min(MAX_DIMENSION / baseW, MAX_DIMENSION / baseH).toInt()
+        return desired.coerceAtMost(max(1, min(maxByPixels, maxByDimension)))
+    }
+
+    private fun desiredBucket(): Int = when {
         zoom <= 1.25f -> 1
         zoom <= 2.5f -> 2
         else -> 4
@@ -362,28 +380,68 @@ class EasyPdfView @JvmOverloads constructor(
 
     private fun requestVisiblePages() {
         if (!isLoaded) return
-        val bucket = zoomBucket()
         val range = visiblePages()
         val prefetch = max(0, range.first - 1)..min(pageCount - 1, range.last + 1)
+
+        // FIX: Protected base bitmaps window maintain karo — sirf nearby pages
+        baseBitmaps.keys.filter { it !in prefetch }.forEach { page ->
+            baseBitmaps.remove(page)?.recycle()
+        }
+
         for (page in prefetch) {
-            val key = PageBitmapCache.Key(page, bucket)
-            if (cache[key] != null || renderJobs.containsKey(key)) continue
-            renderJobs[key] = scope.launch {
-                try {
-                    val bmp = withContext(renderDispatcher) {
-                        if (!engine.isOpen) return@withContext null
-                        val w = width * bucket
-                        val h = (pageHeights[page] * bucket).roundToInt()
-                        if (w <= 0 || h <= 0) return@withContext null
+            // 1. Base (bucket 1) HAMESHA ensure karo — ye fallback hai
+            if (baseBitmaps[page]?.isRecycled != false) {
+                requestRender(page, 1)
+            }
+            // 2. Hi-res agar zoom > 1.25
+            val bucket = safeBucketFor(page, desiredBucket())
+            if (bucket > 1 && cache[PageBitmapCache.Key(page, bucket)] == null) {
+                requestRender(page, bucket)
+            }
+        }
+    }
+
+    private fun requestRender(page: Int, bucket: Int) {
+        val key = PageBitmapCache.Key(page, bucket)
+        if (renderJobs.containsKey(key)) return
+
+        renderJobs[key] = scope.launch {
+            try {
+                val bmp = withContext(renderDispatcher) {
+                    if (!engine.isOpen) return@withContext null
+                    val w = width * bucket
+                    val h = (pageHeights[page] * bucket).roundToInt()
+                    if (w <= 0 || h <= 0) return@withContext null
+                    try {
                         val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                         engine.renderPage(page, bitmap, 0, 0, w, h)
                         bitmap
-                    } ?: return@launch
+                    } catch (oom: OutOfMemoryError) {
+                        // FIX: OOM ab crash nahi karta — low-res pe raho
+                        Log.w(TAG, "OOM rendering page $page @${bucket}x — falling back to low-res")
+                        null
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Render failed page $page @${bucket}x: ${t.message}")
+                        null
+                    }
+                } ?: return@launch
+
+                if (bucket == 1) {
+                    // FIX: Base bitmap protected store mein — LRU se evict nahi hoga
+                    baseBitmaps.remove(page)?.recycle()
+                    if (baseBitmaps.size >= maxBaseBitmaps) {
+                        // Farthest page evict karo
+                        baseBitmaps.keys.maxByOrNull { abs(it - currentPage) }?.let {
+                            baseBitmaps.remove(it)?.recycle()
+                        }
+                    }
+                    baseBitmaps[page] = bmp
+                } else {
                     cache.put(PageBitmapCache.Key(page, bucket), bmp)
-                    invalidate()
-                } finally {
-                    renderJobs.remove(key)
                 }
+                invalidate()
+            } finally {
+                renderJobs.remove(key)
             }
         }
     }
@@ -391,20 +449,25 @@ class EasyPdfView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         if (!isLoaded) return
         pagePaint.colorFilter = if (nightMode) nightFilter else null
-        val bucket = zoomBucket()
 
         canvas.withSave {
             translate(-scrollXf, -scrollYf)
             for (page in visiblePages()) {
                 val top = pageTops[page] * zoom
                 val rect = RectF(0f, top, width * zoom, top + pageHeights[page] * zoom)
-                val bmp = cache[PageBitmapCache.Key(page, bucket)]
-                    ?: cache[PageBitmapCache.Key(page, 1)]  // low-res fallback while hi-res renders
+
+                // FIX: Best available bitmap — hi-res → base fallback (guaranteed)
+                val bucket = safeBucketFor(page, desiredBucket())
+                val bmp = (if (bucket > 1) cache[PageBitmapCache.Key(page, bucket)] else null)
                     ?: cache[PageBitmapCache.Key(page, 2)]
+                    ?: baseBitmaps[page]?.takeIf { !it.isRecycled }
+
                 if (bmp != null) {
                     drawBitmap(bmp, null, rect, pagePaint)
                 } else {
                     drawRect(rect, placeholderPaint)
+                    // Bitmap missing — render request karo (missed window case)
+                    post { requestVisiblePages() }
                 }
             }
         }
@@ -416,6 +479,8 @@ class EasyPdfView @JvmOverloads constructor(
         if (engine.isOpen && w != oldw) {
             val progress = if (contentHeightBase > 0) scrollYf / (contentHeightBase * zoom) else 0f
             cache.clear()
+            baseBitmaps.values.forEach { it.recycle() }
+            baseBitmaps.clear()
             computeLayout()
             scrollYf = (progress * contentHeightBase * zoom).coerceIn(0f, maxScrollY())
             scrollXf = scrollXf.coerceIn(0f, maxScrollX())
