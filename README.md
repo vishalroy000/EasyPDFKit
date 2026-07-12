@@ -115,7 +115,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'com.github.vishalroy000.EasyPDFKit:easypdfkit:v1.0.0'
+   implementation("com.github.vishalroy000.EasyPDFKit:easypdfkit:v1.0.1")
 }
 ```
 </details>
