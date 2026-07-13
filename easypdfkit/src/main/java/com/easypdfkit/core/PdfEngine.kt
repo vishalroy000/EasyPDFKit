@@ -4,9 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.ParcelFileDescriptor
 import com.easypdfkit.source.PdfSource
-import io.legere.pdfiumandroid.PdfDocument
-import io.legere.pdfiumandroid.PdfiumCore
-import io.legere.pdfiumandroid.util.Size
+import com.shockwave.pdfium.PdfDocument
+import com.shockwave.pdfium.PdfiumCore
+import com.shockwave.pdfium.util.Size
 
 /** Thrown when the document is encrypted and the supplied password is wrong/missing. */
 class PdfPasswordException(message: String) : Exception(message)
